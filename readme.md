@@ -337,9 +337,68 @@ typedef struct __attribute__((packed)) {
 
 1. Confirmar protocolo real ESP32 ↔ Feather M0 (SPI directo vs UART, sección 2).
 2. Confirmar si existe divisor resistivo para medir voltaje de batería por ADC.
-3. Definir dataset y arquitectura exacta del modelo TinyML (tamaño de la red, framework de entrenamiento — TensorFlow Lite Micro presumido).
+3. Definir arquitectura exacta de la red (dense vs 1D-CNN, nº de capas) y ejecutar el entrenamiento — ver sección 10 para el plan concreto de datos y pipeline.
 4. Definir número de reintentos y timeout de ACK en el protocolo LoRa.
 5. Definir si el log de cancelaciones (falsos positivos) se usa para reentrenamiento offline del modelo.
+
+---
+
+## 10. Modelo TinyML — qué es, cómo se entrena y dónde conseguir datos
+
+Esta sección estaba pendiente. Responde tres preguntas: **qué** clasifica el modelo, **con qué datos** se entrena, y **dónde/cómo** se entrena y se lleva al ESP32-S2.
+
+### 10.1 Dónde vive el entrenamiento (importante entenderlo primero)
+
+El ESP32 **nunca entrena**. El entrenamiento se hace una sola vez, offline, en una laptop/PC con Python. El resultado es un archivo `.tflite` cuantizado a int8, que se convierte a un arreglo de bytes en C (`model_data[]`) y se compila dentro del firmware. En tiempo real, el ESP32 solo corre `tflite_infer()` (inferencia pura, sin aprendizaje) sobre ese modelo ya congelado. Si más adelante quieren reentrenar con datos nuevos (ej. los falsos positivos logueados, ver sección 6), se repite el ciclo offline y se reflashea el dispositivo — no hay aprendizaje "en vivo" en la pulsera.
+
+### 10.2 Qué debería clasificar el modelo, realmente
+
+Vale la pena separar dos cosas que hoy están mezcladas conceptualmente:
+
+- La **inmovilidad sostenida** (bajo movimiento durante muchas ventanas seguidas) ya la resuelve la lógica determinística de la sección 5 (`consecutive_immobile >= 8`) — **eso no necesita red neuronal**, es un umbral sobre features estadísticos y funciona sin entrenar nada.
+- Donde una red sí aporta valor real es detectando el **patrón característico de una caída/impacto** (pico brusco de aceleración seguido de calma), que es más difícil de capturar con un umbral simple y es justamente lo que existe como dataset público entrenable.
+
+Recomendación: entrenar un **clasificador binario por ventana** `CAÍDA` vs `ACTIVIDAD_NORMAL` (o multiclase si quieren distinguir caminar/trabajar/sentado/caída). Ese `immobility_score` de la sección 5 pasa a ser, en la práctica, la probabilidad de la clase `CAÍDA` que entrega el modelo. La lógica de ventanas consecutivas sigue funcionando igual como filtro anti-falsos-positivos después de la predicción.
+
+### 10.3 De dónde salen los datos de entrenamiento
+
+No existe un dataset público hecho a la medida de "pulsera ESP32 + MPU6050 en trabajador agrícola", pero sí hay datasets públicos de detección de caídas con sensor **en la muñeca** que sirven de punto de partida:
+
+| Dataset | Ubicación del sensor | Tamaño | Frecuencia | Notas |
+|---|---|---|---|---|
+| [FallAllD](https://www.researchgate.net/publication/378760322_Wrist-Based_Fall_Detection_Towards_Generalization_across_Datasets) | cuello, cintura **y muñeca** | 15 sujetos, 6605 instancias (1722 caídas, 4883 AVD) | alta (IMU dedicado) | El más citado para fall detection multi-posición, incluye muñeca por separado |
+| [HR_IMU fall dataset](https://github.com/nhoyh/HR_IMU_falldetection_dataset) | muñeca (mano izquierda) | 21 sujetos, 19 escenarios (6 caídas, 9 AVD, 4 casi-caídas) | **50 Hz — igual que su firmware** | Coincide con la frecuencia ya configurada en `task_sensor_acquisition()` |
+| [Geriatric wrist-worn dataset](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10709028/) | muñeca, dispositivo custom | 41 sujetos, 16 AVD + 8 caídas | IMU + frecuencia cardíaca | Población de adultos mayores, útil si buscan robustez ante marcha lenta |
+| [UP-Fall Detection](https://www.mdpi.com/1424-8220/24/5/1679) | muñeca (simula smartwatch) | 70 secuencias (30 caídas, 40 AVD) | — | Multisensor, incluye cámaras además de IMU |
+
+`HR_IMU` es probablemente el mejor punto de partida porque ya está muestreado a 50 Hz, la misma frecuencia que configuraron en el MPU6050.
+
+### 10.4 Adaptar los datos públicos a su hardware
+
+1. Verificar orientación de ejes del dataset vs. cómo queda montado el MPU6050 en la pulsera física (si no coincide, hay que rotar los ejes en el preprocesamiento, no reentrenar el sensor).
+2. Re-muestrear a 50 Hz si el dataset elegido usa otra frecuencia.
+3. Cortar en ventanas de 64 muestras con 75% de solape — exactamente el mismo esquema de `WINDOW_SIZE`/`WINDOW_STRIDE` de la sección 3, para que el modelo entrenado "vea" datos con la misma forma que verá en producción.
+4. Calcular los mismos features de la sección 5 (media/desv. de `|a|`, energía por eje, cruces por cero, magnitud media del giroscopio) si van con una red densa pequeña — o usar la ventana cruda si optan por una 1D-CNN.
+
+### 10.5 Entrenamiento — dos caminos
+
+**Opción A — Edge Impulse (recomendada para empezar rápido).** Plataforma web con soporte oficial para ESP32: suben el CSV de datos (público + el suyo propio), extraen features automáticamente, entrenan la red desde el navegador, cuantizan a int8 y exportan una librería C++ lista para compilar — sin tener que escribir a mano el pipeline de TensorFlow ni la conversión a TFLite Micro. Es el camino más corto de "tengo datos" a "tengo firmware".
+
+**Opción B — TensorFlow/Keras manual + TensorFlow Lite Micro.** Más control, más trabajo: entrenar en Python con Keras (red densa pequeña de 2-3 capas sobre los features, o una 1D-CNN sobre la ventana cruda si la densa no alcanza precisión suficiente), convertir con `TFLiteConverter` usando un dataset representativo para cuantización int8, generar el arreglo C con `xxd -i model.tflite > model_data.h`, e integrar con la librería `esp-tflite-micro` en el proyecto ESP-IDF/Arduino.
+
+Para un modelo de este tamaño (pocos features de entrada, 2-3 capas), el `.tflite` cuantizado debería pesar unos pocos KB — sin problema para la flash/RAM del ESP32-S2-WROVER.
+
+### 10.6 El paso que no pueden saltarse: datos propios con el hardware real
+
+Los datasets públicos están grabados con sensores distintos, en muñecas distintas, en gente haciendo actividades distintas a labores de campo. Es dominio parecido, no idéntico — un modelo entrenado *solo* con datos públicos casi seguro no generalizará bien a la demo en vivo. El plan realista:
+
+1. Usar el dataset público (`HR_IMU` u otro) para validar que el pipeline de entrenamiento + cuantización + despliegue funciona de punta a punta.
+2. Grabar un dataset propio, pequeño, con la pulsera real: ustedes dos (y si pueden, más voluntarios) haciendo actividades tipo labor de campo (caminar, agacharse, cargar objetos) y caídas simuladas controladas (sobre colchoneta), etiquetando cada sesión.
+3. Reentrenar o hacer fine-tuning del modelo con esos datos propios antes de la demostración final — es lo que va a hacer que el clasificador funcione bien con *su* hardware y *su* forma de usarlo.
+
+### 10.7 Validación
+
+Antes de dar el modelo por bueno: separar un conjunto de prueba (datos que el modelo no vio en entrenamiento), revisar matriz de confusión (interesa sobre todo la tasa de falsos negativos — una caída real no detectada es el peor caso), y medir en el propio ESP32 el tiempo de inferencia y el uso de RAM del "tensor arena" de TFLite Micro para confirmar que corre cómodo a la par de las demás tareas de FreeRTOS.
 
 ---
 

@@ -1,0 +1,18 @@
+# Locks y temporales de KiCad
+*.lck
+~*.lck
+
+# Backups locales (zips generados por KiCad / editor)
+netherlands-backups/
+*-backups/
+
+# Historial local del editor (VS Code local history, etc.)
+.history/
+
+# Auto-guardados de KiCad
+_autosave-*
+fp-info-cache
+
+# Sistema
+.DS_Store
+Thumbs.db

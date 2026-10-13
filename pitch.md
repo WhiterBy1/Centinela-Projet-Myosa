@@ -82,6 +82,7 @@ Decir los límites **uno mismo** convierte la mayor debilidad en credibilidad y 
 | ¿Y si no hay cobertura LoRa / la estación está lejos? | Reintentos + **modo baliza persistente**; LoRa llega a km en campo abierto. Admitir que hay que hacer pruebas de alcance reales. |
 | ¿Por qué no un smartwatch comercial? | Costo, cobertura celular/Bluetooth inexistente en campo, y batería de días vs. horas. |
 | ¿Privacidad? | Solo movimiento y temperatura; nada de audio/vídeo/ubicación continua; procesamiento local. |
+| ¿Está cifrada la comunicación? | **Honesto:** en el prototipo el LoRa P2P viaja en texto plano (el payload es un string compacto; el gateway lo entrega por Ethernet/UDP en base64+JSON, que es *codificación*, no cifrado). Los datos son de bajo riesgo (movimiento, temperatura, zona), pero en producción añadiríamos AES-128-GCM extremo a extremo con contador anti-replay (o LoRaWAN, que lo trae de fábrica). **No decir "encrypted" en las diapositivas.** |
 | ¿Costo por unidad / escalabilidad? | *Preparar BOM aproximado en USD.* Una estación base cubre muchos trabajadores (topología en estrella). |
 | ¿Cómo se alimenta / cuánto dura? | 18650 + deep sleep con wake por interrupción del APDS-9960. *Tener una medición real de consumo.* |
 | ¿Qué aporta la plataforma MYOSA? | ESP32 + sensores del kit como núcleo; añadimos LoRa y la lógica de edge AI. |
@@ -100,6 +101,22 @@ Revisando el repo, estas son las brechas que un jurado técnico puede notar:
 6. **Torre de control web**: en el repo no hay código ni mockup del panel. Es la mitad visual de la demo; necesita existir (aunque sea simple: lista de alertas + zona + severidad).
 7. **Logística**: radio LoRa y baterías Li-ion (18650) en avión → revisar normas de equipaje de mano y la **banda de frecuencia legal en la UE (868 MHz)**: el Feather RFM9x debe ser la variante de 868/915 MHz correcta para usarla en Países Bajos. Llevar plan B de video y un segundo prototipo.
 8. **Datos de impacto con fuente**: estadísticas de accidentes/golpe de calor en trabajadores agrícolas (OIT/ILO, OMS) para la diapositiva 2.
+
+---
+
+## Cadena de comunicación real (según notas del equipo, verificar contra el código)
+
+```
+Pulsera ESP32 ──LoRa P2P (texto plano, claves cortas)──► Gateway Heltec HT-M7603
+   "seq=3,r=5.9,p=-2.1,t=33.1,pr=1010,net=…"              │ Semtech UDP Packet Forwarder
+                                                          ▼  (Ethernet, IP estática, puerto 1700)
+                                             PC: tools/data_recorder.py --lora-listen 1700
+                                             → responde PUSH_ACK / PULL_ACK, decodifica base64+JSON,
+                                               añade RSSI/SNR del gateway → dashboard / grabador
+```
+
+Puntos para explicar en el pitch: no requiere módem ni internet (cable directo gateway↔PC); el gateway mide RSSI/SNR real del enlace; el mismo pipeline sirve para USB, WiFi y LoRa.
+Nota: `tools/data_recorder.py` y el gateway Heltec **no están en este repo** y el `readme.md` aún describe un Feather M0 RFM9x; actualizar los docs para que no se contradigan.
 
 ---
 
